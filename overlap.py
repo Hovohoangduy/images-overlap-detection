@@ -9,7 +9,7 @@ class OverlapDetector:
         self.threshold = threshold
     
     @staticmethod
-    def load_images(images_paths):
+    def load_images(images_paths, resize=False):
         list_images = []
         valid_paths = []
         for image_path in images_paths:
@@ -17,10 +17,11 @@ class OverlapDetector:
             if image is None:
                 continue
             h, w = image.shape[:2]
-            if h > w:
-                image = image[:1280, :]
-            else:
-                image = image[:720, :]
+            if resize:
+                if h > w:
+                    image = image[:1280, :]
+                else:
+                    image = image[:720, :]
             list_images.append(image)
             valid_paths.append(image_path)
         return list_images, valid_paths
@@ -45,12 +46,17 @@ class OverlapDetector:
         if desc1 is None or desc2 is None or desc1.size == 0 or desc2.size == 0:
             return []
         is_binary = desc1.dtype == np.uint8
-        if is_binary:
-            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        else:
-            matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         try:
-            raw_matches = matcher.knnMatch(desc1, desc2, k=2)
+            if is_binary:
+                matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                raw_matches = matcher.knnMatch(desc1, desc2, k=2)
+            else:
+                # Use FLANN for float descriptors (SIFT)
+                FLANN_INDEX_KDTREE = 1
+                index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+                search_params = dict(checks=50)
+                matcher = cv2.FlannBasedMatcher(index_params, search_params)
+                raw_matches = matcher.knnMatch(desc1, desc2, k=2)
         except cv2.error:
             return []
         good_matches = []
@@ -107,21 +113,32 @@ class OverlapDetector:
         h_src, w_src = src.shape[:2]
         h_dst, w_dst = dst.shape[:2]
 
-        corners_src = np.float32([[0, 0], [0, h_src - 1], [w_src - 1, h_src - 1], [w_src - 1, 0]]).reshape(-1, 1, 2)
-        dst_corners_from_src = cv2.perspectiveTransform(corners_src, H)
+        # Build non-empty masks from image content (non-black pixels)
+        src_nonzero = (np.any(src != 0, axis=2)).astype(np.uint8) * 255
+        dst_nonzero = (np.any(dst != 0, axis=2)).astype(np.uint8) * 255
 
-        warp_mask_dst = np.zeros((h_dst, w_dst), dtype=np.uint8)
-        cv2.fillConvexPoly(warp_mask_dst, np.int32(dst_corners_from_src), 255)
-        dst_mask = np.full((h_dst, w_dst), 255, dtype=np.uint8)
+        # Warp source nonzero mask to destination frame to get actual overlapping pixels
+        warped_src_on_dst = cv2.warpPerspective(
+            src_nonzero, H, (w_dst, h_dst), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
 
-        intersection = cv2.bitwise_and(warp_mask_dst, dst_mask)
-        union = cv2.bitwise_or(warp_mask_dst, dst_mask)
-        union_sum = int(np.count_nonzero(union))
-        overlap_ratio = float(np.count_nonzero(intersection) / union_sum) if union_sum > 0 else 0.0
+        # Clean small holes/noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        warped_src_on_dst = cv2.morphologyEx(warped_src_on_dst, cv2.MORPH_CLOSE, kernel)
+        dst_clean = cv2.morphologyEx(dst_nonzero, cv2.MORPH_CLOSE, kernel)
 
+        intersection = cv2.bitwise_and(warped_src_on_dst, dst_clean)
+        union = cv2.bitwise_or(warped_src_on_dst, dst_clean)
+        inter_area = int(np.count_nonzero(intersection))
+        union_area = int(np.count_nonzero(union))
+        overlap_ratio = float(inter_area / union_area) if union_area > 0 else 0.0
+
+        # Also compute overlap w.r.t source area (useful for asymmetric cases)
+        src_area_on_dst = int(np.count_nonzero(warped_src_on_dst))
+
+        # Map intersection back to source frame for source-side polygon drawing
         src_overlap_mask = cv2.warpPerspective(
-            intersection, H_inv, (w_src, h_src),
-            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+            intersection, H_inv, (w_src, h_src), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
         )
 
         src_result = OverlapDetector.apply_mask(src, src_overlap_mask)
@@ -135,11 +152,13 @@ class OverlapDetector:
             if np.count_nonzero(mask) > 0:
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for cnt in contours:
+                    if cv2.contourArea(cnt) < 50:
+                        continue
                     approx = cv2.approxPolyDP(cnt, 0.01 * cv2.arcLength(cnt, True), True)
                     cv2.polylines(res, [approx], True, (0, 255, 0), 2)
                     poly_list.append(approx.reshape(-1, 2).tolist())
 
-        if union_sum == 0 or overlap_ratio == 0:
+        if union_area == 0 or inter_area == 0 or overlap_ratio == 0:
             return None
 
         cv2.imwrite(f"tmp/{prefix}_src_overlap.jpg", src_result)
@@ -147,6 +166,9 @@ class OverlapDetector:
 
         return {
             "overlap_ratio": overlap_ratio,
+            "intersection_area": inter_area,
+            "union_area": union_area,
+            "src_area_on_dst": src_area_on_dst,
             "src_polys": poly_src,
             "dst_polys": poly_dst,
         }
@@ -180,22 +202,28 @@ class OverlapDetector:
         cv2.imwrite(output_path, vis)
 
     def estimate_homography(self, src, dst, ransac_thresh=8.0, overlap_thresh=0):
-        if src.shape[0] != dst.shape[0]:
-            kp1, desc1 = self.find_features(src, mode="AKAZE")
-            kp2, desc2 = self.find_features(dst, mode="AKAZE")
-            matches = self.match_features(desc1, desc2, ratio=0.55)
-            matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=65) # 65
-        elif src.shape[0] == dst.shape[0] and src.shape[0] < src.shape[1]:
-            kp1, desc1 = self.find_features(src, mode="AKAZE")
-            kp2, desc2 = self.find_features(dst, mode="AKAZE")
-            matches = self.match_features(desc1, desc2, ratio=0.7)
-            matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=45) # 45
-        else:
-            kp1, desc1 = self.find_features(src, mode="AKAZE")
-            kp2, desc2 = self.find_features(dst, mode="AKAZE")
-            matches = self.match_features(desc1, desc2, ratio=0.7)
-            matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=40) # 50
+        # if src.shape[0] != dst.shape[0]:
+        #     kp1, desc1 = self.find_features(src, mode="AKAZE")
+        #     kp2, desc2 = self.find_features(dst, mode="AKAZE")
+        #     matches = self.match_features(desc1, desc2, ratio=0.55)
+        #     matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=65) # 65
+        # elif src.shape[0] == dst.shape[0] and src.shape[0] < src.shape[1]:
+        #     kp1, desc1 = self.find_features(src, mode="AKAZE")
+        #     kp2, desc2 = self.find_features(dst, mode="AKAZE")
+        #     matches = self.match_features(desc1, desc2, ratio=0.7)
+        #     matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=45) # 45
+        # else:
+        #     kp1, desc1 = self.find_features(src, mode="AKAZE")
+        #     kp2, desc2 = self.find_features(dst, mode="AKAZE")
+        #     matches = self.match_features(desc1, desc2, ratio=0.7)
+        #     matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=40) # 50
         # print("DEBUG LEN MACHES: ", len(matches))
+
+        kp1, desc1 = self.find_features(src, mode="AKAZE")
+        kp2, desc2 = self.find_features(dst, mode="AKAZE")
+        matches = self.match_features(desc1, desc2, ratio=0.75)
+        matches = self.filter_by_angle_cosine(kp1, kp2, matches, max_angle_deg=85) # 50
+
         if len(matches) < 12:
             return None, None, None
 
@@ -353,8 +381,8 @@ class OverlapDetector:
 if __name__ == "__main__":
     detector = OverlapDetector()
     image_paths = [
-        r"tmp\img1.jpeg",
-        r"tmp\img2.jpeg"
+        r"tmp\7a.jpg",
+        r"tmp\11b.jpg"
     ]
     overlap_pairs, pths = detector.overlap_detector(image_paths)
     print(overlap_pairs)
